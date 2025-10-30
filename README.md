@@ -1,7 +1,7 @@
 # Terraform Onboarding Guide
 
 ## Overview
-This directory contains the Terraform-based replacement for the legacy `onboard.sh` automation. The conversion preserves the original provisioning flow while making it declarative and repeatable. It works for both tenant-level and management-group onboarding. Two files coordinate the onboarding process:
+This directory contains the Terraform-based replacement for the `onboard.sh` automation. The conversion preserves the original provisioning flow while making it declarative and repeatable. It works for both tenant-level and management-group onboarding. Two files coordinate the onboarding process:
 
 * `main.tf` – Terraform configuration that provisions Azure resources, assigns Microsoft Graph roles, and deploys the ARM template (or Bicep template compiled to ARM) at management-group scope.
 * `bootstrap.sh` – A companion script invoked via Terraform's `external` data source to read `parameters.sh` without modification and to run preflight permission checks before any infrastructure change occurs.
