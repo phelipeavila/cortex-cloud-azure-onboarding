@@ -31,7 +31,7 @@ The resulting Terraform files can be used as-is across management groups because
    * The signed-in principal has one of `Owner`, `User Access Administrator`, or `Contributor` on the target management group.
    * The same principal has `Owner` or `Contributor` on the subscription that will host the onboarding resources.
    * The account holds a directory role capable of assigning Graph app roles (Application Administrator, Cloud Application Administrator, Privileged Role Administrator, or Global Administrator).
-3. **Automatic grant & cleanup (optional)** – If `grant_self_mg_contributor=true`, the script can temporarily grant the current principal `Contributor` at the management group scope when it detects a deficiency. The grant is recorded in `.mg_contributor_assign_id` so Terraform can remove it in the same run via `null_resource.cleanup_temp_mg_contributor` once preflight passes.
+3. **Automatic grant & cleanup (optional)** – If `grant_self_mg_admin=true`, the script can temporarily grant the current principal `Owner` (or the role specified in the `MG_ADMIN_ROLE` variable at the top of `bootstrap.sh`) at the management group scope when it detects a deficiency. The grant is recorded in `.mg_admin_assign_id` so Terraform can remove it in the same run via `null_resource.cleanup_temp_mg_admin` once preflight passes.
 
 The script returns `preflight_ok` and `preflight_error` fields. Terraform guards the management-group deployment with a `lifecycle.precondition`; if preflight fails, the apply stops immediately with the descriptive error coming from `bootstrap.sh`.
 
@@ -39,7 +39,7 @@ The script returns `preflight_ok` and `preflight_error` fields. Terraform guards
 * **Locals** – Read `graphAPIRoles.json`, decode values emitted by `bootstrap.sh`, compute resource names, and dynamically build the ARM template parameter map by inspecting whichever `template.json` is present.
 * **Resource creation** – Mirrors the actions from `onboard.sh` for the resource group, managed identity, role definition, role assignment, Microsoft Graph role assignments, and deployment.
 * **Template deployment guard** – Uses `lifecycle.precondition` to require a single `template.json`, a non-empty management group ID, and successful preflight.
-* **Same-run cleanup** – `null_resource.cleanup_temp_mg_contributor` executes the command returned by `bootstrap.sh` to delete any temporary role assignment after the deployment succeeds.
+* **Same-run cleanup** – `null_resource.cleanup_temp_mg_admin` executes the command returned by `bootstrap.sh` to delete any temporary role assignment after the deployment succeeds.
 
 ## Using the Terraform Workflow
 1. Ensure Azure CLI is installed and logged in (`az login`).
@@ -49,11 +49,11 @@ The script returns `preflight_ok` and `preflight_error` fields. Terraform guards
    root_management_group_id = "<tenant-id-or-management-group-id>"
    subscription_id          = "<subscription-guid>"
    location                 = "eastus"
-   grant_self_mg_contributor = true   # optional
+   grant_self_mg_admin       = true   # optional
    preflight_enabled         = true   # default
    ```
 4. Run `terraform init` and `terraform apply`.
-5. If preflight grants temporary Contributor access, follow the script guidance: run `az account clear && az login --use-device-code`, then re-run `terraform apply`. The cleanup step runs automatically after a successful deploy.
+5. If preflight grants temporary Owner access (or the role specified in `MG_ADMIN_ROLE`), follow the script guidance: run `az account clear && az login --use-device-code`, then re-run `terraform apply`. The cleanup step runs automatically after a successful deploy.
 
 ## Relationship to `onboard.sh`
 Because the conversion was disciplined, you can still diff the original `onboard.sh` against `main.tf` to find where each section moved. All Azure CLI invocations that mutated infrastructure have been replaced with Terraform resources. Operational logic (permission checks, parameter parsing) lives inside `bootstrap.sh`, which mirrors the procedural portions of the bash script. The Terraform code focuses solely on declarative infrastructure—matching the responsibilities split that `onboard.sh` previously mixed in a single script.

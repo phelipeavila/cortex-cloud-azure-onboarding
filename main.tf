@@ -46,7 +46,7 @@ data "external" "bootstrap" {
     local.target_mg,
     var.subscription_id,
     var.preflight_enabled ? "true" : "false",
-    var.grant_self_mg_contributor ? "true" : "false"
+    var.grant_self_mg_admin ? "true" : "false"
   ]
 }
 
@@ -144,9 +144,9 @@ variable "preflight_enabled" {
   default     = true
 }
 
-# Optional: let Terraform grant current principal Contributor at MG scope
-variable "grant_self_mg_contributor" {
-  description = "If true, Terraform assigns the current principal Contributor at the management group scope before deployment"
+# Optional: let Terraform grant current principal Owner (or other admin role) at MG scope
+variable "grant_self_mg_admin" {
+  description = "If true, Terraform assigns the current principal Owner (or role defined in bootstrap.sh) at the management group scope before deployment"
   type        = bool
   default     = false
 }
@@ -262,9 +262,9 @@ resource "azurerm_management_group_template_deployment" "cortex_policy" {
   ]
 }
 
-# Same-run cleanup of temporary MG Contributor assignment (if any)
-resource "null_resource" "cleanup_temp_mg_contributor" {
-  count = var.grant_self_mg_contributor && try(data.external.bootstrap.result.cleanup_cmd != "", false) ? 1 : 0
+# Same-run cleanup of temporary MG admin role assignment (if any)
+resource "null_resource" "cleanup_temp_mg_admin" {
+  count = var.grant_self_mg_admin && try(data.external.bootstrap.result.cleanup_cmd != "", false) ? 1 : 0
 
   provisioner "local-exec" {
     command     = data.external.bootstrap.result.cleanup_cmd
