@@ -1,0 +1,35 @@
+# Example Terraform auto variables file
+# Copy this file to terraform.auto.tfvars and fill in your values
+# Note: terraform.auto.tfvars is automatically loaded by Terraform
+
+# =============================================================================
+# REQUIRED: Choose ONE of the following options
+# =============================================================================
+
+# Option 1: Tenant-level onboarding
+# Use this for tenant-wide deployments
+tenant_id = "00000000-0000-0000-0000-000000000000"
+
+# Option 2: Management Group-level onboarding
+# Use this for management group-scoped deployments
+# management_group_id = "my-management-group-id"
+
+# =============================================================================
+# REQUIRED: Subscription configuration
+# =============================================================================
+
+# Subscription ID where onboarding resources will be created
+subscription_id = "00000000-0000-0000-0000-000000000000"
+
+# =============================================================================
+# OPTIONAL: Location and preflight settings
+# =============================================================================
+
+# Azure region for creating onboarding resources (default: "eastus")
+location = "eastus"
+
+# Enable preflight permission checks before deployment (default: true)
+# Set to false to skip permission validation
+
+preflight_enabled = true
+
