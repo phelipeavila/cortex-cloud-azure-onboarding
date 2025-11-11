@@ -1,118 +1,115 @@
 #!/bin/bash
 set -euo pipefail
 
-# Role name to grant at management group scope (can be changed to other roles like Contributor, User Access Administrator, etc.)
-MG_ADMIN_ROLE="Owner"
+# Preflight script version control
+# To update: visit https://github.com/PaloAltoNetworks/cc-permissions-preflight/commits/main
+# and update PREFLIGHT_SCRIPT_VERSION below with the desired commit SHA or branch/tag
+# Use "main" for latest version, or pin to a specific commit SHA for production stability
+readonly PREFLIGHT_SCRIPT_BASE_URL="https://raw.githubusercontent.com/PaloAltoNetworks/cc-permissions-preflight"
+readonly PREFLIGHT_SCRIPT_VERSION="d7c52a32b2421de7b50a95c19de5eaf653b34403"
 
-# Args: <management_group_id> <subscription_id> <preflight_enabled:true|false> <grant_self_mg_admin:true|false>
-MG_ID="${1:-}"
-SUBSCRIPTION_ID="${2:-}"
-PREFLIGHT_ENABLED="${3:-true}"
-GRANT_SELF_MG_ADMIN="${4:-false}"
+# Args: <target_mg_id> <subscription_id> <preflight_enabled:true|false> <onboarding_type:tenant|mg>
+# Note: target_mg_id is either tenant_id (for tenant-level) or management_group_id (for MG-level)
+# Terraform validates that only one is provided before calling this script
+readonly MG_ID="${1:-}"
+readonly SUBSCRIPTION_ID="${2:-}"
+readonly PREFLIGHT_ENABLED="${3:-true}"
+readonly ONBOARDING_TYPE="${4:-mg}"
 
 # Load parameters.sh and convert fields that are JSON-like to valid JSON strings
-if [ -f ./parameters.sh ]; then
+if [[ -f ./parameters.sh ]]; then
   # shellcheck disable=SC1091
   source ./parameters.sh 2>/dev/null || true
 fi
 
-# Normalize JSON-like strings: single quotes -> double, then escape quotes for JSON embedding
-json_escape() { sed 's/"/\\"/g'; }
-to_json_string() { sed "s/'/\"/g" | json_escape; }
+# Strip ANSI color codes and control characters
+strip_ansi() {
+  local str="$1"
+  # Remove ANSI escape sequences (colors, formatting, etc.)
+  printf '%s' "$str" | sed -E 's/\x1b\[[0-9;]*[mGKHJh]//g; s/\x1b\([B0]//g; s/\x0d//g'
+}
 
-TAGS_JSON=$(echo "${tags:-}" | to_json_string)
-TEMPLATE_VERSION_JSON=$(echo "${template_version:-}" | to_json_string)
+# Escape string for JSON output (handles quotes, newlines, backslashes, ANSI codes)
+json_escape() {
+  local str="$1"
+  # First strip ANSI codes, then escape for JSON
+  local clean
+  clean=$(strip_ansi "$str")
+  # Properly escape for JSON: backslash, quotes, tabs, and newlines
+  printf '%s' "$clean" | sed 's/\\/\\\\/g; s/"/\\"/g; s/'"$(printf '\t')"'/\\t/g' | awk '{printf "%s\\n", $0}' | sed '$ s/\\n$//'
+}
 
-# Local state file to persist temporary role assignment id between runs
-ASSIGN_STATE_FILE=".mg_admin_assign_id"
+# Convert shell-style JSON to proper JSON (single quotes to double quotes)
+to_json_string() {
+  local str="$1"
+  json_escape "$(printf '%s' "$str" | sed "s/'/\"/g")"
+}
 
-# Preflight (optional)
+# Pre-process JSON fields from parameters.sh
+TAGS_JSON=$(to_json_string "${tags:-}")
+TEMPLATE_VERSION_JSON=$(to_json_string "${template_version:-}")
+
+# Initialize preflight result variables
 PREFLIGHT_OK="false"
 PREFLIGHT_ERROR=""
-GRANTED_MG_ADMIN="false"
-CLEANUP_CMD=""
-LOGIN_MSG_ESCAPED=""
-SKIP_FURTHER_CHECKS=""
+PREFLIGHT_OUTPUT=""
 
-# Preflight checks: verify CLI login, MG permissions, subscription permissions, and AAD roles
-if [ "${PREFLIGHT_ENABLED}" != "true" ]; then
-  # Preflight disabled: skip all checks
-  PREFLIGHT_OK="true"
-elif [ -z "${MG_ID}" ] || [ -z "${SUBSCRIPTION_ID}" ]; then
-  # Missing required arguments for preflight
-  PREFLIGHT_OK="false"
-  PREFLIGHT_ERROR="Management Group ID and Subscription ID are required for preflight checks."
-else
-  # Check 1: Azure CLI login status
-  if ! az account show >/dev/null 2>&1; then
-    PREFLIGHT_OK="false"; PREFLIGHT_ERROR="Azure CLI not logged in. Run 'az login' and try again."
-  else
-    # Check 2: Resolve signed-in principal (user or service principal)
-    OBJECT_ID=$(az ad signed-in-user show --query id -o tsv 2>/dev/null || true)
-    if [ -z "$OBJECT_ID" ]; then
-      UPN_OR_APPID=$(az account show --query user.name -o tsv 2>/dev/null || true)
-      [ -n "$UPN_OR_APPID" ] && OBJECT_ID=$(az ad sp show --id "$UPN_OR_APPID" --query id -o tsv 2>/dev/null || true)
-    fi
-    if [ -z "$OBJECT_ID" ]; then
-      PREFLIGHT_OK="false"; PREFLIGHT_ERROR="Cannot resolve signed-in principal (user or service principal). Ensure you're logged in with 'az login'."
-    else
-      # Check 3: Management Group permissions
-      MG_ROLES=$(az role assignment list --assignee "$OBJECT_ID" --scope "/providers/Microsoft.Management/managementGroups/${MG_ID}" -o tsv --query "[].roleDefinitionName" 2>/dev/null || true)
-      if ! echo "$MG_ROLES" | grep -Eiq 'Owner|User Access Administrator|Contributor'; then
-        # Insufficient MG permissions: attempt to grant temporary role if enabled
-        if [ "${GRANT_SELF_MG_ADMIN}" = "true" ]; then
-          ASSIGN_ID=$(az role assignment create --assignee "$OBJECT_ID" --role "${MG_ADMIN_ROLE}" --scope "/providers/Microsoft.Management/managementGroups/${MG_ID}" --query id -o tsv 2>/dev/null || true)
-          if [ -n "$ASSIGN_ID" ]; then
-            # Successfully granted temporary role; instruct user to re-auth and rerun
-            GRANTED_MG_ADMIN="true"
-            CLEANUP_CMD="az role assignment delete --ids ${ASSIGN_ID}"
-            echo "$ASSIGN_ID" > "$ASSIGN_STATE_FILE" 2>/dev/null || true
-            PREFLIGHT_OK="false"
-            PREFLIGHT_ERROR="Granted temporary ${MG_ADMIN_ROLE} at MG. Please run 'az account clear && az login --use-device-code' and rerun Terraform. On success, bootstrap will remove the temporary role."
-          fi
-        fi
-        if [ "$GRANTED_MG_ADMIN" = "true" ]; then
-          # Skip subscription/AAD checks since we're in the grant flow
-          SKIP_FURTHER_CHECKS="true"
-        else
-          # Grant not enabled or failed; user lacks MG permissions
-          PREFLIGHT_OK="false"; PREFLIGHT_ERROR="Insufficient Management Group permissions. Need Owner/User Access Administrator/Contributor on /providers/Microsoft.Management/managementGroups/${MG_ID}. Enable grant_self_mg_admin=true or have an MG Owner assign the role."
-        fi
-      else
-        # Already has sufficient MG role; if a previous temp assignment exists, prepare same-run cleanup
-        if [ -f "$ASSIGN_STATE_FILE" ]; then
-          PREV_ASSIGN_ID=$(cat "$ASSIGN_STATE_FILE" 2>/dev/null | head -1)
-          # Validate ID format before cleanup to prevent accidental commands
-          if [ -n "$PREV_ASSIGN_ID" ] && [[ "$PREV_ASSIGN_ID" =~ ^/providers/Microsoft\. ]]; then
-            # Valid temp assignment found; schedule cleanup and skip further checks
-            GRANTED_MG_ADMIN="true"
-            CLEANUP_CMD="az role assignment delete --ids ${PREV_ASSIGN_ID}"
-            rm -f "$ASSIGN_STATE_FILE" >/dev/null 2>&1 || true
-            PREFLIGHT_OK="true"
-            SKIP_FURTHER_CHECKS="true"
-          fi
-        fi
-      fi
-      # Check 4 & 5: Subscription and AAD permissions (unless skipped)
-      if [ "$SKIP_FURTHER_CHECKS" != "true" ]; then
-        SUB_ROLES=$(az role assignment list --assignee "$OBJECT_ID" --scope "/subscriptions/${SUBSCRIPTION_ID}" --include-inherited -o tsv --query "[].roleDefinitionName" 2>/dev/null || true)
-        if ! echo "$SUB_ROLES" | grep -Eiq 'Owner|Contributor'; then
-          PREFLIGHT_OK="false"; PREFLIGHT_ERROR="Insufficient subscription permissions on /subscriptions/${SUBSCRIPTION_ID}. Need Owner or Contributor."
-        fi
-        AAD_ROLES=$(az rest --method GET --url https://graph.microsoft.com/v1.0/me/memberOf --headers Content-Type=application/json --query "value[].displayName" -o tsv 2>/dev/null || true)
-        if ! echo "$AAD_ROLES" | grep -Eiq 'Application Administrator|Cloud Application Administrator|Privileged Role Administrator|Global Administrator'; then
-          PREFLIGHT_OK="false"; PREFLIGHT_ERROR="Insufficient Azure AD directory role. Need Application Administrator, Cloud Application Administrator, Privileged Role Administrator, or Global Administrator to assign Graph app roles."
-        fi
-        # All checks passed; mark preflight as OK
-        if [ -z "$PREFLIGHT_ERROR" ]; then
-          PREFLIGHT_OK="true"
-        fi
-      fi
+# Run preflight checks if enabled
+run_preflight_checks() {
+  local preflight_url="${PREFLIGHT_SCRIPT_BASE_URL}/${PREFLIGHT_SCRIPT_VERSION}/preflight_check.sh"
+  local preflight_input
+  
+  # Check if audit logs are enabled by examining template_version
+  # This applies to both tenant and management group onboarding
+  local audit_enabled="n"
+  if [[ -n "${template_version:-}" ]]; then
+    # Parse template_version JSON to check for any key starting with AUDIT_LOGS
+    # template_version is a JSON object like: {"BASE-arm_org_base":"1.0.0","AUDIT_LOGS-arm_organization_audit":"1.0.0"}
+    if echo "${template_version}" | sed "s/'/\"/g" | grep -qE '"AUDIT_LOGS-[^"]+":'; then
+      audit_enabled="y"
     fi
   fi
+  
+  # Build preflight input based on onboarding type
+  if [[ "${ONBOARDING_TYPE}" == "tenant" ]]; then
+    # Tenant-level: menu choice (5) + newline + audit logs flag
+    preflight_input="5
+${audit_enabled}"
+  else
+    # Management Group-level: menu choice (4) + newline + MG ID + newline + audit logs flag
+    preflight_input="4
+${MG_ID}
+${audit_enabled}"
+  fi
+  
+  # Run preflight script with process substitution
+  local output exit_code
+  output=$(echo -e "${preflight_input}" | bash <(curl -fsSL "${preflight_url}") 2>&1) || exit_code=$?
+  exit_code=${exit_code:-0}
+  
+  # Always capture output for logging (escape for JSON)
+  PREFLIGHT_OUTPUT=$(json_escape "$output")
+  
+  if [[ ${exit_code} -eq 0 ]]; then
+    PREFLIGHT_OK="true"
+  else
+    PREFLIGHT_OK="false"
+    PREFLIGHT_ERROR="Preflight check failed (exit code: ${exit_code}). See preflight_output for details."
+  fi
+}
+
+# Execute preflight checks
+if [[ "${PREFLIGHT_ENABLED}" != "true" ]]; then
+  # Preflight disabled
+  PREFLIGHT_OK="true"
+elif [[ -z "${MG_ID}" || -z "${SUBSCRIPTION_ID}" ]]; then
+  # Missing required parameters
+  PREFLIGHT_ERROR="Management Group ID and Subscription ID are required for preflight checks."
+else
+  run_preflight_checks
 fi
 
-# Output combined JSON map of string keys/values
+# Output JSON result for Terraform external data source
 cat <<EOF
 {
   "tenant_id": "${tenant_id:-}",
@@ -129,10 +126,8 @@ cat <<EOF
   "collector_sa_unique_id": "${collector_sa_unique_id:-}",
   "preflight_ok": "${PREFLIGHT_OK}",
   "preflight_error": "${PREFLIGHT_ERROR}",
-  "granted_mg_admin": "${GRANTED_MG_ADMIN}",
-  "cleanup_cmd": "${CLEANUP_CMD}",
-  "login_message": "${LOGIN_MSG_ESCAPED:-}"
+  "preflight_output": "${PREFLIGHT_OUTPUT}",
+  "grant_cmd": "",
+  "login_message": ""
 }
 EOF
-
-

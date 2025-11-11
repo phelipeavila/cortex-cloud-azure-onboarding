@@ -1,3 +1,7 @@
+# ============================================================================
+# TERRAFORM CONFIGURATION
+# ============================================================================
+
 terraform {
   required_version = ">= 1.0"
   required_providers {
@@ -20,14 +24,17 @@ terraform {
   }
 }
 
-# Configure providers
+# ============================================================================
+# PROVIDER CONFIGURATION
+# ============================================================================
+
 provider "azurerm" {
   features {
     resource_group {
       prevent_deletion_if_contains_resources = false
     }
   }
-  use_cli = true
+  use_cli                    = true
   skip_provider_registration = true
 }
 
@@ -39,89 +46,18 @@ provider "azapi" {
   use_cli = true
 }
 
-# Combined parameters + preflight (optional)
-data "external" "bootstrap" {
-  program = [
-    "${path.module}/bootstrap.sh",
-    local.target_mg,
-    var.subscription_id,
-    var.preflight_enabled ? "true" : "false",
-    var.grant_self_mg_admin ? "true" : "false"
-  ]
-}
+# ============================================================================
+# INPUT VARIABLES
+# ============================================================================
 
-# Read Graph API roles from JSON file
-data "local_file" "graph_roles" {
-  filename = "${path.module}/graphAPIRoles.json"
-}
-
-# Parse Graph API roles
-locals {
-  graph_roles = jsondecode(data.local_file.graph_roles.content).graphAPIRoles
-  parameters  = data.external.bootstrap.result
-  
-  # Parse tags from parameters
-  tags = jsondecode(local.parameters.tags)
-  
-  # Parse template version from parameters
-  template_version = jsondecode(local.parameters.template_version)
-  
-  # Resource names
-  onboarding_resource_group_name = "cortex-onboarding-${local.parameters.resource_suffix}"
-  identity_name                  = "cortex-mi-${local.parameters.resource_suffix}"
-  role_name                      = "cortex-mi-role-${local.parameters.resource_suffix}"
-}
-
-# Auto-detect template.json in the current directory and build params dynamically
-locals {
-  target_mg = coalesce(trimspace(var.root_management_group_id), trimspace(var.management_group))
-
-  template_candidates = fileset(path.module, "template.json")
-  template_path       = "${path.module}/${tolist(local.template_candidates)[0]}"
-
-  template_doc    = jsondecode(file(local.template_path))
-  template_params = toset(keys(lookup(local.template_doc, "parameters", {})))
-
-  base_params = {
-    resourceSuffix = { value = local.parameters.resource_suffix }
-    templateId     = { value = local.parameters.template_id }
-    tenantId       = { value = local.parameters.tenant_id }
-    customerObjectId = { value = local.parameters.customer_object_id }
-    outpostClientId  = { value = local.parameters.outpost_client_id }
-    uploadOutputUrl  = { value = local.parameters.upload_output_url }
-    subscriptionId   = { value = var.subscription_id }
-    resourceGroup    = { value = azurerm_resource_group.onboarding.name }
-    uaid             = { value = azurerm_user_assigned_identity.cortex.name }
-    tags             = { value = local.tags }
-    templateVersion  = { value = local.template_version }
-    connectorId      = { value = local.parameters.connector_id }
-  }
-
-  optional_params = merge(
-    contains(local.template_params, "auditStorageAllowedIps") ? {
-      auditStorageAllowedIps = { value = local.parameters.audit_storage_allowed_ips }
-    } : {},
-    contains(local.template_params, "audience") ? {
-      audience = { value = local.parameters.audience }
-    } : {},
-    contains(local.template_params, "collectorSaUniqueId") ? {
-      collectorSaUniqueId = { value = local.parameters.collector_sa_unique_id }
-    } : {}
-  )
-
-  final_params = merge(local.base_params, local.optional_params)
-}
-
-# Input variables
-variable "root_management_group_id" {
-  description = "Root management group ID (use tenant root MG for tenant-level templates)"
+variable "tenant_id" {
+  description = "Tenant ID for tenant-level onboarding. Provide either tenant_id OR management_group_id, not both."
   type        = string
   default     = ""
 }
 
-# Backward-compatible alias (deprecated): use root_management_group_id instead
-variable "management_group" {
-  description = "[Deprecated] Use root_management_group_id. If set, used as fallback."
+variable "management_group_id" {
+  description = "Management Group ID for management group-level onboarding. Provide either tenant_id OR management_group_id, not both."
   type        = string
   default     = ""
 }
@@ -137,52 +73,143 @@ variable "location" {
   default     = "eastus"
 }
 
-# Optional: enforce preflight permission checks (default: true)
 variable "preflight_enabled" {
   description = "Run permission preflight checks before deployment"
   type        = bool
   default     = true
 }
 
-# Optional: let Terraform grant current principal Owner (or other admin role) at MG scope
-variable "grant_self_mg_admin" {
-  description = "If true, Terraform assigns the current principal Owner (or role defined in bootstrap.sh) at the management group scope before deployment"
-  type        = bool
-  default     = false
+# ============================================================================
+# DATA SOURCES
+# ============================================================================
+
+# Bootstrap script: loads parameters.sh and runs preflight checks
+data "external" "bootstrap" {
+  program = [
+    "${path.module}/bootstrap.sh",
+    local.target_mg,
+    var.subscription_id,
+    var.preflight_enabled ? "true" : "false",
+    local.tenant_id_provided ? "tenant" : "mg"
+  ]
 }
 
-# Data sources
+# Read Graph API roles configuration
+data "local_file" "graph_roles" {
+  filename = "${path.module}/graphAPIRoles.json"
+}
+
+# Azure subscription information
 data "azurerm_subscription" "main" {
   subscription_id = var.subscription_id
 }
 
+# Current Azure client configuration
 data "azurerm_client_config" "current" {}
 
-# Get Microsoft Graph service principal
+# Microsoft Graph service principal (for role assignments)
 data "azuread_service_principal" "graph" {
   client_id = "00000003-0000-0000-c000-000000000000"
 }
 
-# Preflight moved into bootstrap; enforce via lifecycle below
+# ============================================================================
+# LOCALS: Configuration and Parameter Building
+# ============================================================================
 
-# Create resource group for onboarding
+locals {
+  # --------------------------------------------------------------------------
+  # Parse bootstrap output and external data
+  # --------------------------------------------------------------------------
+  graph_roles      = jsondecode(data.local_file.graph_roles.content).graphAPIRoles
+  parameters       = data.external.bootstrap.result
+  tags             = jsondecode(local.parameters.tags)
+  template_version = jsondecode(local.parameters.template_version)
+
+  # --------------------------------------------------------------------------
+  # Resource naming
+  # --------------------------------------------------------------------------
+  onboarding_resource_group_name = "cortex-onboarding-${local.parameters.resource_suffix}"
+  identity_name                  = "cortex-mi-${local.parameters.resource_suffix}"
+  role_name                      = "cortex-mi-role-${local.parameters.resource_suffix}"
+
+  # --------------------------------------------------------------------------
+  # Onboarding scope validation and target determination
+  # --------------------------------------------------------------------------
+  tenant_id_provided        = trimspace(var.tenant_id) != ""
+  management_group_provided = trimspace(var.management_group_id) != ""
+
+  validation_error = local.tenant_id_provided && local.management_group_provided ? "Error: Both tenant_id and management_group_id are provided. You must provide only ONE of: tenant_id (for tenant-level onboarding) OR management_group_id (for management group-level onboarding)." : ""
+
+  # Determine target MG: tenant_id is used directly as the tenant root MG ID
+  target_mg = local.tenant_id_provided ? trimspace(var.tenant_id) : trimspace(var.management_group_id)
+
+  # --------------------------------------------------------------------------
+  # Template detection and parameter building
+  # --------------------------------------------------------------------------
+  template_candidates = fileset(path.module, "template.json")
+  template_path       = "${path.module}/${tolist(local.template_candidates)[0]}"
+  template_doc        = jsondecode(file(local.template_path))
+  template_params     = toset(keys(lookup(local.template_doc, "parameters", {})))
+
+  # Base parameters (always required)
+  base_params = {
+    resourceSuffix   = { value = local.parameters.resource_suffix }
+    templateId       = { value = local.parameters.template_id }
+    tenantId         = { value = local.parameters.tenant_id }
+    customerObjectId = { value = local.parameters.customer_object_id }
+    outpostClientId  = { value = local.parameters.outpost_client_id }
+    uploadOutputUrl  = { value = local.parameters.upload_output_url }
+    subscriptionId   = { value = var.subscription_id }
+    resourceGroup    = { value = azurerm_resource_group.onboarding.name }
+    uaid             = { value = azurerm_user_assigned_identity.cortex.name }
+    tags             = { value = local.tags }
+    templateVersion  = { value = local.template_version }
+    connectorId      = { value = local.parameters.connector_id }
+  }
+
+  # Optional parameters (only included if present in template.json)
+  optional_params = merge(
+    contains(local.template_params, "auditStorageAllowedIps") ? {
+      auditStorageAllowedIps = { value = local.parameters.audit_storage_allowed_ips }
+    } : {},
+    contains(local.template_params, "audience") ? {
+      audience = { value = local.parameters.audience }
+    } : {},
+    contains(local.template_params, "collectorSaUniqueId") ? {
+      collectorSaUniqueId = { value = local.parameters.collector_sa_unique_id }
+    } : {}
+  )
+
+  # Final parameter map for ARM template deployment
+  final_params = merge(local.base_params, local.optional_params)
+}
+
+# ============================================================================
+# RESOURCES: Infrastructure Setup
+# ============================================================================
+
+# ----------------------------------------------------------------------------
+# Resource Group
+# ----------------------------------------------------------------------------
 resource "azurerm_resource_group" "onboarding" {
   name     = local.onboarding_resource_group_name
   location = var.location
-
-  tags = local.tags
+  tags     = local.tags
 }
 
-# Create user-assigned managed identity
+# ----------------------------------------------------------------------------
+# Managed Identity
+# ----------------------------------------------------------------------------
 resource "azurerm_user_assigned_identity" "cortex" {
   name                = local.identity_name
   resource_group_name = azurerm_resource_group.onboarding.name
   location            = azurerm_resource_group.onboarding.location
-
-  tags = local.tags
+  tags                = local.tags
 }
 
-# Create custom role definition at management group scope
+# ----------------------------------------------------------------------------
+# Custom Role Definition
+# ----------------------------------------------------------------------------
 resource "azurerm_role_definition" "cortex_mi_role" {
   name        = local.role_name
   scope       = "/providers/Microsoft.Management/managementGroups/${local.target_mg}"
@@ -208,7 +235,9 @@ resource "azurerm_role_definition" "cortex_mi_role" {
   ]
 }
 
-# Assign custom role to managed identity
+# ----------------------------------------------------------------------------
+# Role Assignment: Custom Role to Managed Identity
+# ----------------------------------------------------------------------------
 resource "azurerm_role_assignment" "cortex_mi_role_assignment" {
   scope              = "/providers/Microsoft.Management/managementGroups/${local.target_mg}"
   role_definition_id = azurerm_role_definition.cortex_mi_role.role_definition_resource_id
@@ -220,8 +249,9 @@ resource "azurerm_role_assignment" "cortex_mi_role_assignment" {
   ]
 }
 
-
-# Grant Microsoft Graph API permissions to customer object
+# ----------------------------------------------------------------------------
+# Microsoft Graph API Role Assignments
+# ----------------------------------------------------------------------------
 resource "azuread_app_role_assignment" "graph_roles" {
   for_each = toset(local.graph_roles)
 
@@ -230,28 +260,44 @@ resource "azuread_app_role_assignment" "graph_roles" {
   resource_object_id  = data.azuread_service_principal.graph.object_id
 }
 
-# Deploy ARM template at management group scope
+# ============================================================================
+# RESOURCES: Policy Deployment
+# ============================================================================
+
+# ----------------------------------------------------------------------------
+# ARM Template Deployment at Management Group Scope
+# ----------------------------------------------------------------------------
 resource "azurerm_management_group_template_deployment" "cortex_policy" {
   name                = "cortex-policy-${local.parameters.resource_suffix}"
   management_group_id = "/providers/Microsoft.Management/managementGroups/${local.target_mg}"
   location            = var.location
 
-  template_content = file(local.template_path)
-
+  template_content   = file(local.template_path)
   parameters_content = jsonencode(local.final_params)
 
   lifecycle {
+    # Validate exactly one template.json exists
     precondition {
       condition     = length(local.template_candidates) == 1
       error_message = "Expected exactly one template.json in the current directory."
     }
+
+    # Validate only one onboarding scope is provided
+    precondition {
+      condition     = local.validation_error == ""
+      error_message = local.validation_error
+    }
+
+    # Validate at least one onboarding scope is provided
     precondition {
       condition     = length(local.target_mg) > 0
-      error_message = "You must set root_management_group_id (or legacy management_group) to a non-empty value."
+      error_message = "You must provide either tenant_id (for tenant-level onboarding) or management_group_id (for management group-level onboarding)."
     }
+
+    # Validate preflight checks passed (if enabled)
     precondition {
       condition     = var.preflight_enabled ? try(data.external.bootstrap.result.preflight_ok == "true", true) : true
-      error_message = "Preflight failed: ${try(data.external.bootstrap.result.preflight_error, "unknown error")}"
+      error_message = "Preflight failed: ${try(data.external.bootstrap.result.preflight_error, "unknown error")}${try(data.external.bootstrap.result.grant_cmd != "", false) ? "\n\nTo grant the required permissions, run:\n${data.external.bootstrap.result.grant_cmd}" : ""}"
     }
   }
 
@@ -262,27 +308,22 @@ resource "azurerm_management_group_template_deployment" "cortex_policy" {
   ]
 }
 
-# Same-run cleanup of temporary MG admin role assignment (if any)
-resource "null_resource" "cleanup_temp_mg_admin" {
-  count = var.grant_self_mg_admin && try(data.external.bootstrap.result.cleanup_cmd != "", false) ? 1 : 0
+# ============================================================================
+# LOCALS: Deployment Outputs
+# ============================================================================
 
-  provisioner "local-exec" {
-    command     = data.external.bootstrap.result.cleanup_cmd
-    interpreter = ["/bin/bash", "-lc"]
-  }
-
-  depends_on = [
-    azurerm_management_group_template_deployment.cortex_policy
-  ]
-}
-
-# Parse deployment outputs to get policy assignment name
 locals {
-  deployment_outputs = jsondecode(azurerm_management_group_template_deployment.cortex_policy.output_content)
+  deployment_outputs     = jsondecode(azurerm_management_group_template_deployment.cortex_policy.output_content)
   policy_assignment_name = local.deployment_outputs.created.value.policyAssignmentName
 }
 
-# Create policy remediation
+# ============================================================================
+# RESOURCES: Policy Remediation
+# ============================================================================
+
+# ----------------------------------------------------------------------------
+# Policy Remediation Task
+# ----------------------------------------------------------------------------
 resource "azapi_resource" "cortex_remediation" {
   type      = "Microsoft.PolicyInsights/remediations@2021-10-01"
   name      = "cortex-remediation-${local.parameters.resource_suffix}-${formatdate("YYYY-MM-DD-hhmmss", timestamp())}"
@@ -299,7 +340,10 @@ resource "azapi_resource" "cortex_remediation" {
   ]
 }
 
-# Outputs
+# ============================================================================
+# OUTPUTS
+# ============================================================================
+
 output "resource_group_name" {
   description = "Name of the created resource group"
   value       = azurerm_resource_group.onboarding.name
@@ -323,4 +367,23 @@ output "policy_assignment_name" {
 output "remediation_name" {
   description = "Name of the created remediation task"
   value       = azapi_resource.cortex_remediation.name
+}
+
+output "preflight_status" {
+  description = "Preflight check status and output"
+  value = {
+    enabled = var.preflight_enabled
+    passed  = try(data.external.bootstrap.result.preflight_ok == "true", false)
+    output  = try(data.external.bootstrap.result.preflight_output, "")
+  }
+}
+
+output "onboarding_configuration" {
+  description = "Onboarding configuration details"
+  value = {
+    onboarding_type     = local.tenant_id_provided ? "tenant" : "management_group"
+    target_scope        = local.target_mg
+    tenant_id           = var.tenant_id != "" ? var.tenant_id : null
+    management_group_id = var.management_group_id != "" ? var.management_group_id : null
+  }
 }

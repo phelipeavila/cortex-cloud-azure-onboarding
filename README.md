@@ -11,7 +11,7 @@ The table below shows how major blocks of the original bash script were ported t
 
 | Original step in `onboard.sh` | Terraform / bootstrap equivalent |
 | --- | --- |
-| Source `parameters.sh` and prompt for management group, subscription, location | `bootstrap.sh` sources `parameters.sh` directly. Variables `root_management_group_id`, `subscription_id`, and `location` replace interactive prompts. |
+| Source `parameters.sh` and prompt for management group, subscription, location | `bootstrap.sh` sources `parameters.sh` directly. Variables `tenant_id` or `management_group_id`, `subscription_id`, and `location` replace interactive prompts. |
 | Create onboarding resource group | `azurerm_resource_group.onboarding` resource block in `main.tf` |
 | Create user-assigned managed identity | `azurerm_user_assigned_identity.cortex` |
 | Define custom management-group role and assign to identity | `azurerm_role_definition.cortex_mi_role` and `azurerm_role_assignment.cortex_mi_role_assignment` |
@@ -23,38 +23,88 @@ The table below shows how major blocks of the original bash script were ported t
 The resulting Terraform files can be used as-is across management groups because the logic that previously relied on bash loops and conditional branches is now expressed through Terraform expressions and locals.
 
 ## How `bootstrap.sh` Works
-`bootstrap.sh` is executed through `data "external" "bootstrap"`. It performs three jobs:
+`bootstrap.sh` is executed through `data "external" "bootstrap"`. It performs three main jobs:
 
 1. **Load parameters** – It sources `parameters.sh` and emits a JSON map that Terraform can consume. Strings that represent JSON (for example `tags` and `template_version`) are normalized so Terraform can `jsondecode` them later.
-2. **Preflight validation** – It verifies that:
-   * `az account show` succeeds (you are logged in).
-   * The signed-in principal has one of `Owner`, `User Access Administrator`, or `Contributor` on the target management group.
-   * The same principal has `Owner` or `Contributor` on the subscription that will host the onboarding resources.
-   * The account holds a directory role capable of assigning Graph app roles (Application Administrator, Cloud Application Administrator, Privileged Role Administrator, or Global Administrator).
-3. **Automatic grant & cleanup (optional)** – If `grant_self_mg_admin=true`, the script can temporarily grant the current principal `Owner` (or the role specified in the `MG_ADMIN_ROLE` variable at the top of `bootstrap.sh`) at the management group scope when it detects a deficiency. The grant is recorded in `.mg_admin_assign_id` so Terraform can remove it in the same run via `null_resource.cleanup_temp_mg_admin` once preflight passes.
 
-The script returns `preflight_ok` and `preflight_error` fields. Terraform guards the management-group deployment with a `lifecycle.precondition`; if preflight fails, the apply stops immediately with the descriptive error coming from `bootstrap.sh`.
+2. **Auto-detect audit logs** – Examines the `template_version` variable to detect if audit logs are enabled by checking for any key starting with `AUDIT_LOGS-`. This information is automatically passed to the preflight script.
+
+3. **Preflight validation** – When `preflight_enabled=true` (default), it downloads and runs the official preflight check script from the [cc-permissions-preflight repository](https://github.com/PaloAltoNetworks/cc-permissions-preflight). The script version is pinned in `PREFLIGHT_SCRIPT_VERSION` for production stability. The script validates all required permissions for onboarding:
+   * For tenant-level onboarding: runs `azure-tenant` checks with audit logs flag
+   * For management group-level onboarding: runs `azure-mg` checks with management group ID and audit logs flag
+   
+   All preflight output is captured and available in Terraform outputs for debugging and audit purposes.
+
+The script returns `preflight_ok`, `preflight_error`, and `preflight_output` fields. Terraform guards the management-group deployment with a `lifecycle.precondition`; if preflight fails, the apply stops immediately with the descriptive error from `bootstrap.sh`.
 
 ## Key Sections in `main.tf`
-* **Locals** – Read `graphAPIRoles.json`, decode values emitted by `bootstrap.sh`, compute resource names, and dynamically build the ARM template parameter map by inspecting whichever `template.json` is present.
+* **Locals** – Read `graphAPIRoles.json`, decode values emitted by `bootstrap.sh`, compute resource names, validate that only one of `tenant_id` or `management_group_id` is provided, and dynamically build the ARM template parameter map by inspecting whichever `template.json` is present.
 * **Resource creation** – Mirrors the actions from `onboard.sh` for the resource group, managed identity, role definition, role assignment, Microsoft Graph role assignments, and deployment.
-* **Template deployment guard** – Uses `lifecycle.precondition` to require a single `template.json`, a non-empty management group ID, and successful preflight.
-* **Same-run cleanup** – `null_resource.cleanup_temp_mg_admin` executes the command returned by `bootstrap.sh` to delete any temporary role assignment after the deployment succeeds.
+* **Template deployment guard** – Uses `lifecycle.precondition` to require a single `template.json`, exactly one of `tenant_id` or `management_group_id` (not both), and successful preflight.
 
 ## Using the Terraform Workflow
+
 1. Ensure Azure CLI is installed and logged in (`az login`).
+
 2. Copy `parameters.sh`, `graphAPIRoles.json`, `template.json`, `bootstrap.sh`, and `main.tf` into the working directory (along with optional `terraform.auto.tfvars`).
-3. Set the required Terraform variables (for example in `terraform.auto.tfvars`). `root_management_group_id` can be either the tenant ID (for tenant-wide deployments) or the target management group ID:
+
+3. **(Optional) Pin preflight script version** – Edit `bootstrap.sh` and update `PREFLIGHT_SCRIPT_VERSION` with a specific commit SHA for production stability. Default is a pinned commit. To update: visit https://github.com/PaloAltoNetworks/cc-permissions-preflight/commits/main
+
+4. Set the required Terraform variables (for example in `terraform.auto.tfvars`). You must provide **exactly one** of `tenant_id` or `management_group_id`:
+   
+   **For tenant-level onboarding:**
    ```hcl
-   root_management_group_id = "<tenant-id-or-management-group-id>"
-   subscription_id          = "<subscription-guid>"
-   location                 = "eastus"
-   grant_self_mg_admin       = true   # optional
-   preflight_enabled         = true   # default
+   tenant_id           = "<tenant-id>"
+   subscription_id     = "<subscription-guid>"
+   location            = "eastus"
+   preflight_enabled   = true   # default
    ```
-4. Run `terraform init` and `terraform apply`.
-5. If preflight grants temporary Owner access (or the role specified in `MG_ADMIN_ROLE`), follow the script guidance: run `az account clear && az login --use-device-code`, then re-run `terraform apply`. The cleanup step runs automatically after a successful deploy.
+   
+   **For management group-level onboarding:**
+   ```hcl
+   management_group_id = "<management-group-id>"
+   subscription_id     = "<subscription-guid>"
+   location            = "eastus"
+   preflight_enabled   = true   # default
+   ```
+   
+   See `terraform.auto.tfvars.example` for a complete example.
+
+5. Run `terraform init` and `terraform apply`.
+
+6. If preflight checks fail, the error message will include details from the preflight script output. Run the suggested commands to grant required permissions, then re-run `terraform apply`.
+
+7. After successful deployment, view preflight results and configuration:
+   ```bash
+   terraform output preflight_status
+   terraform output onboarding_configuration
+   ```
+
+## Terraform Outputs
+
+After successful deployment, Terraform provides several useful outputs:
+
+* **resource_group_name** – Name of the created onboarding resource group
+* **managed_identity_name** – Name of the created managed identity
+* **managed_identity_principal_id** – Principal ID of the managed identity
+* **policy_assignment_name** – Name of the created policy assignment
+* **remediation_name** – Name of the created remediation task
+* **preflight_status** – Preflight check results including full output for debugging
+* **onboarding_configuration** – Configuration details (onboarding type, target scope, etc.)
+
+View outputs with: `terraform output` or `terraform output <output_name>`
+
+## Preflight Script Version Control
+
+The preflight script version is controlled in `bootstrap.sh` via the `PREFLIGHT_SCRIPT_VERSION` constant. By default, it's pinned to a specific commit for production stability. To update:
+
+1. Visit: https://github.com/PaloAltoNetworks/cc-permissions-preflight/commits/main
+2. Find the desired commit and copy its SHA
+3. Edit `bootstrap.sh` line 9: `readonly PREFLIGHT_SCRIPT_VERSION="<commit-sha>"`
+4. Commit the change to version control
+
+Use `"main"` for the latest version (not recommended for production).
 
 ## Relationship to `onboard.sh`
-Because the conversion was disciplined, you can still diff the original `onboard.sh` against `main.tf` to find where each section moved. All Azure CLI invocations that mutated infrastructure have been replaced with Terraform resources. Operational logic (permission checks, parameter parsing) lives inside `bootstrap.sh`, which mirrors the procedural portions of the bash script. The Terraform code focuses solely on declarative infrastructure—matching the responsibilities split that `onboard.sh` previously mixed in a single script.
 
+Because the conversion was disciplined, you can still diff the original `onboard.sh` against `main.tf` to find where each section moved. All Azure CLI invocations that mutated infrastructure have been replaced with Terraform resources. Operational logic (permission checks, parameter parsing) lives inside `bootstrap.sh`, which mirrors the procedural portions of the bash script. The Terraform code focuses solely on declarative infrastructure—matching the responsibilities split that `onboard.sh` previously mixed in a single script.
