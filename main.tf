@@ -212,9 +212,9 @@ resource "azurerm_role_definition" "cortex_mi_role" {
       "Microsoft.Authorization/roleAssignments/*",
       "Microsoft.Authorization/policyDefinitions/*",
       "Microsoft.Authorization/policyAssignments/*",
-      "Microsoft.Authorization/*/read",
       "Microsoft.EventHub/namespaces/*",
-      "Microsoft.Insights/diagnosticSettings/*"
+      "Microsoft.Insights/diagnosticSettings/*",
+      "Microsoft.Compute/galleries/*"
     ]
   }
 
