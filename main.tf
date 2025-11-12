@@ -13,14 +13,6 @@ terraform {
       source  = "hashicorp/azuread"
       version = "~> 2.0"
     }
-    azapi = {
-      source  = "Azure/azapi"
-      version = "~> 1.0"
-    }
-    null = {
-      source  = "hashicorp/null"
-      version = "~> 3.2"
-    }
   }
 }
 
@@ -39,10 +31,6 @@ provider "azurerm" {
 }
 
 provider "azuread" {
-  use_cli = true
-}
-
-provider "azapi" {
   use_cli = true
 }
 
@@ -324,16 +312,10 @@ locals {
 # ----------------------------------------------------------------------------
 # Policy Remediation Task
 # ----------------------------------------------------------------------------
-resource "azapi_resource" "cortex_remediation" {
-  type      = "Microsoft.PolicyInsights/remediations@2021-10-01"
-  name      = "cortex-remediation-${local.parameters.resource_suffix}-${formatdate("YYYY-MM-DD-hhmmss", timestamp())}"
-  parent_id = "/providers/Microsoft.Management/managementGroups/${local.target_mg}"
-
-  body = jsonencode({
-    properties = {
-      policyAssignmentId = "/providers/Microsoft.Management/managementGroups/${local.target_mg}/providers/Microsoft.Authorization/policyAssignments/${local.policy_assignment_name}"
-    }
-  })
+resource "azurerm_management_group_policy_remediation" "cortex_remediation" {
+  name                 = "cortex-remediation-${local.parameters.resource_suffix}-${formatdate("YYYY-MM-DD-hhmmss", timestamp())}"
+  management_group_id  = "/providers/Microsoft.Management/managementGroups/${local.target_mg}"
+  policy_assignment_id = "/providers/Microsoft.Management/managementGroups/${local.target_mg}/providers/Microsoft.Authorization/policyAssignments/${local.policy_assignment_name}"
 
   depends_on = [
     azurerm_management_group_template_deployment.cortex_policy
@@ -366,7 +348,7 @@ output "policy_assignment_name" {
 
 output "remediation_name" {
   description = "Name of the created remediation task"
-  value       = azapi_resource.cortex_remediation.name
+  value       = azurerm_management_group_policy_remediation.cortex_remediation.name
 }
 
 output "preflight_status" {
