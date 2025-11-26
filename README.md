@@ -17,7 +17,7 @@ The table below shows how major blocks of the original bash script were ported t
 | Define custom management-group role and assign to identity | `azurerm_role_definition.cortex_mi_role` and `azurerm_role_assignment.cortex_mi_role_assignment` |
 | Assign Graph API application roles to the customer object | `azuread_app_role_assignment.graph_roles` for_each loop |
 | Deploy `template.json` at management-group scope | `azurerm_management_group_template_deployment.cortex_policy` |
-| Poll for policy outputs and trigger remediation | `local.deployment_outputs` reads deployment outputs and `azapi_resource.cortex_remediation` creates the remediation task |
+| Poll for policy outputs and trigger remediation | `local.deployment_outputs` reads deployment outputs and `azurerm_management_group_policy_remediation.cortex_remediation` creates the remediation task |
 | Ad-hoc permission checks sprinkled throughout | `bootstrap.sh` centralizes them using Azure CLI before Terraform touches Azure resources |
 
 The resulting Terraform files can be used as-is across management groups because the logic that previously relied on bash loops and conditional branches is now expressed through Terraform expressions and locals.
@@ -46,7 +46,9 @@ The script returns `preflight_ok`, `preflight_error`, and `preflight_output` fie
 
 1. Ensure Azure CLI is installed and logged in (`az login`).
 
-2. Copy `parameters.sh`, `graphAPIRoles.json`, `template.json`, `bootstrap.sh`, and `main.tf` into the working directory (along with optional `terraform.auto.tfvars`).
+2. **Prepare files**:
+   * Download the onboarding connector package from the Cortex portal. This contains `parameters.sh`, `template.json`, and `graphAPIRoles.json`.
+   * Copy those files into your working directory alongside `bootstrap.sh` and `main.tf` from this repository.
 
 3. **(Optional) Pin preflight script version** – Edit `bootstrap.sh` and update `PREFLIGHT_SCRIPT_VERSION` with a specific commit SHA for production stability. Default is a pinned commit. To update: visit https://github.com/PaloAltoNetworks/cc-permissions-preflight/commits/main
 
