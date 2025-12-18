@@ -293,7 +293,27 @@ if [ -n "$existing_role" ] && [ "$existing_role" != "null" ]; then
     expected_sorted=$(printf '%s\n' "${expected_actions[@]}" | sort)
     
     if [ "$current_actions" != "$expected_sorted" ]; then
-        log WARN "Role permissions differ from expected. Updating role definition..."
+        log WARN "Role permissions differ from expected:"
+        
+        # Find missing permissions (in expected but not in current)
+        missing=$(comm -23 <(echo "$expected_sorted") <(echo "$current_actions"))
+        if [ -n "$missing" ]; then
+            log WARN "  Missing permissions:"
+            while IFS= read -r perm; do
+                log WARN "    + $perm"
+            done <<< "$missing"
+        fi
+        
+        # Find extra permissions (in current but not in expected)
+        extra=$(comm -13 <(echo "$expected_sorted") <(echo "$current_actions"))
+        if [ -n "$extra" ]; then
+            log WARN "  Extra permissions (will be removed):"
+            while IFS= read -r perm; do
+                log WARN "    - $perm"
+            done <<< "$extra"
+        fi
+        
+        log INFO "Updating role definition..."
         
         # Get the role ID for update
         role_id=$(echo "$existing_role" | grep -o '"id": *"[^"]*"' | head -1 | sed 's/"id": *"\([^"]*\)"/\1/')
@@ -327,12 +347,18 @@ EOF
 )
         echo "$update_def" > /tmp/role_def.json
         
-        if exec_with_spinner "az role definition update --role-definition @/tmp/role_def.json -o tsv $AZ_OPTS 2>/dev/null" > /tmp/rd_output; then
+        if exec_with_spinner "az role definition update --role-definition @/tmp/role_def.json -o tsv $AZ_OPTS 2>/tmp/rd_error" > /tmp/rd_output; then
             log INFO "Role definition updated successfully."
         else
             log WARN "Could not update role definition. Continuing with existing permissions."
+            if [ -s /tmp/rd_error ]; then
+                log WARN "Error details:"
+                while IFS= read -r line; do
+                    log WARN "  $line"
+                done < /tmp/rd_error
+            fi
         fi
-        rm -f /tmp/rd_output /tmp/role_def.json
+        rm -f /tmp/rd_output /tmp/role_def.json /tmp/rd_error
     else
         log INFO "Role permissions are correct."
     fi
