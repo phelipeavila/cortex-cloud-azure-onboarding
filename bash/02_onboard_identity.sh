@@ -235,8 +235,23 @@ log "" "Done."
 # ----------------------------------------------------------------------------
 # Defines a custom role with permissions required for Cortex to operate.
 # The role is scoped to the target Management Group.
-log INFO "Creating\Fetching role for identity..."
+log INFO "Creating/Updating role for identity..."
 role_name="cortex-mi-role-$resource_suffix"
+
+# Define the expected permissions (sorted for comparison)
+expected_actions=(
+    "Microsoft.Authorization/policyAssignments/*"
+    "Microsoft.Authorization/policyDefinitions/*"
+    "Microsoft.Authorization/roleAssignments/*"
+    "Microsoft.Authorization/roleDefinitions/*"
+    "Microsoft.Compute/galleries/*"
+    "Microsoft.EventHub/namespaces/*"
+    "Microsoft.Insights/diagnosticSettings/*"
+    "Microsoft.Resources/deployments/*"
+    "Microsoft.Resources/subscriptions/read"
+    "Microsoft.Resources/subscriptions/resourceGroups/*"
+)
+
 role_def=$(cat << EOF
 {
     "name": "$role_name",
@@ -263,35 +278,95 @@ role_def=$(cat << EOF
 EOF
 )
 
-ROLE_DEF_CREATED=false
-while true; do
-    mi_role_name=$(az role definition list --name $role_name --query '[].name' -o tsv $AZ_OPTS)
-    if [ -n "$mi_role_name" ]; then
-        log INFO "Role definition $role_name has been found (id: $mi_role_name)."
-        break
-    elif [ "$ROLE_DEF_CREATED" = "false" ]; then
-        log INFO "Role definition could not be found. Creating it..." 1
-        create_rd_output=""
-        
-        # Write role definition to a temporary file to avoid eval/syntax issues with special chars in JSON
-        echo "$role_def" > /tmp/role_def.json
+# Check if role definition exists
+existing_role=$(az role definition list --name "$role_name" --query '[0]' -o json $AZ_OPTS 2>/dev/null)
 
-        exec_with_spinner "az role definition create --role-definition @/tmp/role_def.json -o tsv $AZ_OPTS" > /tmp/rd_output
-        create_rd_output=$(cat /tmp/rd_output)
+if [ -n "$existing_role" ] && [ "$existing_role" != "null" ]; then
+    mi_role_name=$(echo "$existing_role" | grep -o '"name": *"[^"]*"' | head -1 | sed 's/"name": *"\([^"]*\)"/\1/')
+    log INFO "Role definition $role_name found (id: $mi_role_name). Verifying permissions..."
+    
+    # Get current actions from the existing role (sorted)
+    current_actions=$(echo "$existing_role" | grep -o '"actions": *\[[^]]*\]' | head -1 | \
+        grep -oE '"Microsoft\.[^"]+' | tr -d '"' | sort)
+    
+    # Compare sorted actions
+    expected_sorted=$(printf '%s\n' "${expected_actions[@]}" | sort)
+    
+    if [ "$current_actions" != "$expected_sorted" ]; then
+        log WARN "Role permissions differ from expected. Updating role definition..."
         
-        # Cleanup
-        rm -f /tmp/rd_output /tmp/role_def.json
-
-        if [ -z "$create_rd_output" ]; then
-            log ERROR "Role definition could not be created!"
-            exit 1
+        # Get the role ID for update
+        role_id=$(echo "$existing_role" | grep -o '"id": *"[^"]*"' | head -1 | sed 's/"id": *"\([^"]*\)"/\1/')
+        
+        # Create update definition with id included
+        update_def=$(cat << EOF
+{
+    "id": "$role_id",
+    "name": "$role_name",
+    "isCustom": true,
+    "description": "Custom role for Managed Identity ($resource_suffix).",
+    "assignableScopes": [
+        "/providers/Microsoft.Management/managementGroups/${management_group}"
+    ],
+    "permissions": [{
+        "actions": [
+            "Microsoft.Resources/deployments/*",
+            "Microsoft.Resources/subscriptions/resourceGroups/*",
+            "Microsoft.Resources/subscriptions/read",
+            "Microsoft.Authorization/roleDefinitions/*",
+            "Microsoft.Authorization/roleAssignments/*",
+            "Microsoft.Authorization/policyDefinitions/*",
+            "Microsoft.Authorization/policyAssignments/*",
+            "Microsoft.EventHub/namespaces/*",
+            "Microsoft.Insights/diagnosticSettings/*",
+            "Microsoft.Compute/galleries/*"
+        ]
+    }]
+}
+EOF
+)
+        echo "$update_def" > /tmp/role_def.json
+        
+        if exec_with_spinner "az role definition update --role-definition @/tmp/role_def.json -o tsv $AZ_OPTS 2>/dev/null" > /tmp/rd_output; then
+            log INFO "Role definition updated successfully."
+        else
+            log WARN "Could not update role definition. Continuing with existing permissions."
         fi
-        log "" "Done."
-        ROLE_DEF_CREATED=true
+        rm -f /tmp/rd_output /tmp/role_def.json
+    else
+        log INFO "Role permissions are correct."
     fi
+else
+    # Role doesn't exist, create it
+    log INFO "Role definition not found. Creating it..." 1
+    
+    echo "$role_def" > /tmp/role_def.json
+    exec_with_spinner "az role definition create --role-definition @/tmp/role_def.json -o tsv $AZ_OPTS" > /tmp/rd_output
+    create_rd_output=$(cat /tmp/rd_output)
+    rm -f /tmp/rd_output /tmp/role_def.json
 
-    sleep $MI_RETRY_SEC
-done
+    if [ -z "$create_rd_output" ]; then
+        log ERROR "Role definition could not be created!"
+        exit 1
+    fi
+    log "" "Done."
+    
+    # Wait for role definition to propagate
+    log INFO "Waiting for role definition to propagate..."
+    for i in {1..10}; do
+        mi_role_name=$(az role definition list --name "$role_name" --query '[].name' -o tsv $AZ_OPTS 2>/dev/null)
+        if [ -n "$mi_role_name" ]; then
+            log INFO "Role definition $role_name is ready (id: $mi_role_name)."
+            break
+        fi
+        sleep $MI_RETRY_SEC
+    done
+    
+    if [ -z "$mi_role_name" ]; then
+        log ERROR "Role definition was created but could not be verified!"
+        exit 1
+    fi
+fi
 
 # Create Managed Identity
 # ----------------------------------------------------------------------------
@@ -302,11 +377,12 @@ identity_name="cortex-mi-$resource_suffix"
 
 MI_CREATED=false
 while true; do
+    # Query for principalId (object ID) - required for role assignments
     mi_output=$(az identity list --subscription "$subscription_id" --resource-group "$resource_group" \
-        --query "[?name=='$identity_name'].[name,clientId]" \
+        --query "[?name=='$identity_name'].[name,principalId]" \
         -o tsv $AZ_OPTS)
     if [ -n "$mi_output" ]; then
-        log INFO "Managed identity has been found. (namne: $identity_name)."
+        log INFO "Managed identity has been found. (name: $identity_name)."
         break
     elif [ "$MI_CREATED" = "false" ]; then
         log INFO "Managed identity could not be found. Creating it..." 1
@@ -314,7 +390,7 @@ while true; do
         exec_with_spinner "az identity create --name \"$identity_name\" --resource-group \"$resource_group\" \
             --subscription \"$subscription_id\" \
             --location \"$location\" \
-            --query \"[name,clientId]\" \
+            --query \"[name,principalId]\" \
             -o tsv $AZ_OPTS" > /tmp/mi_output
         mi_output=$(cat /tmp/mi_output)
         rm -f /tmp/mi_output
@@ -330,27 +406,30 @@ while true; do
     sleep $MI_RETRY_SEC
 done
 
-# Unpack tsv into variables
-read -r mi_id mi_principal_id <<< "$mi_output"
+# Unpack tsv into variables (name, principalId/objectId)
+read -r mi_name mi_principal_id <<< "$mi_output"
 
 # Assign role to identity
 # ----------------------------------------------------------------------------
 # Assigns the custom role created earlier to the Managed Identity
 # at the Management Group scope, granting it the necessary permissions.
-log INFO "Assigning role to identity... " 1
+log INFO "Checking role assignment for identity..."
 while true; do
+    # Check if the SPECIFIC role is assigned (not just any role)
     assignment=$(az role assignment list --all \
         --assignee "$mi_principal_id" \
-        -o tsv $AZ_OPTS)
+        --role "$mi_role_name" \
+        --scope "/providers/Microsoft.Management/managementGroups/$management_group" \
+        -o tsv $AZ_OPTS 2>/dev/null)
 
     if [ -n "$assignment" ]; then
+        log INFO "Role '$mi_role_name' is already assigned to identity."
         break
     fi
 
     umi_role=""
-    # Using retry function combined with exec_with_spinner is tricky with return values
-    # So we implement simple spinner for this one call
-    log "" "Creating assignment..." 1
+    # Role not assigned, create it
+    log INFO "Role '$mi_role_name' not assigned. Creating assignment..." 1
     exec_with_spinner "az role assignment create \
       --assignee \"$mi_principal_id\" \
       --role \"$mi_role_name\" \
