@@ -278,16 +278,15 @@ role_def=$(cat << EOF
 EOF
 )
 
-# Check if role definition exists
-existing_role=$(az role definition list --name "$role_name" --query '[0]' -o json $AZ_OPTS 2>/dev/null)
+# Check if role definition exists - query the role ID and actions directly
+mi_role_name=$(az role definition list --name "$role_name" --query '[0].name' -o tsv $AZ_OPTS 2>/dev/null)
 
-if [ -n "$existing_role" ] && [ "$existing_role" != "null" ]; then
-    mi_role_name=$(echo "$existing_role" | grep -o '"name": *"[^"]*"' | head -1 | sed 's/"name": *"\([^"]*\)"/\1/')
+if [ -n "$mi_role_name" ]; then
     log INFO "Role definition $role_name found (id: $mi_role_name). Verifying permissions..."
     
-    # Get current actions from the existing role (sorted)
-    current_actions=$(echo "$existing_role" | grep -o '"actions": *\[[^]]*\]' | head -1 | \
-        grep -oE '"Microsoft\.[^"]+' | tr -d '"' | sort)
+    # Get current actions directly using az query (handles multi-line JSON properly)
+    current_actions=$(az role definition list --name "$role_name" \
+        --query '[0].permissions[0].actions[]' -o tsv $AZ_OPTS 2>/dev/null | sort)
     
     # Compare sorted actions
     expected_sorted=$(printf '%s\n' "${expected_actions[@]}" | sort)
@@ -316,32 +315,33 @@ if [ -n "$existing_role" ] && [ "$existing_role" != "null" ]; then
         log INFO "Updating role definition..."
         
         # Get the role ID for update
-        role_id=$(echo "$existing_role" | grep -o '"id": *"[^"]*"' | head -1 | sed 's/"id": *"\([^"]*\)"/\1/')
+        role_id=$(az role definition list --name "$role_name" --query '[0].id' -o tsv $AZ_OPTS 2>/dev/null)
         
-        # Create update definition with id included
+        # Create update definition - Azure CLI expects 'roleName' not 'name' for updates
         update_def=$(cat << EOF
 {
-    "id": "$role_id",
-    "name": "$role_name",
-    "isCustom": true,
-    "description": "Custom role for Managed Identity ($resource_suffix).",
-    "assignableScopes": [
+    "Id": "$role_id",
+    "roleName": "$role_name",
+    "IsCustom": true,
+    "Description": "Custom role for Managed Identity ($resource_suffix).",
+    "AssignableScopes": [
         "/providers/Microsoft.Management/managementGroups/${management_group}"
     ],
-    "permissions": [{
-        "actions": [
-            "Microsoft.Resources/deployments/*",
-            "Microsoft.Resources/subscriptions/resourceGroups/*",
-            "Microsoft.Resources/subscriptions/read",
-            "Microsoft.Authorization/roleDefinitions/*",
-            "Microsoft.Authorization/roleAssignments/*",
-            "Microsoft.Authorization/policyDefinitions/*",
-            "Microsoft.Authorization/policyAssignments/*",
-            "Microsoft.EventHub/namespaces/*",
-            "Microsoft.Insights/diagnosticSettings/*",
-            "Microsoft.Compute/galleries/*"
-        ]
-    }]
+    "Actions": [
+        "Microsoft.Resources/deployments/*",
+        "Microsoft.Resources/subscriptions/resourceGroups/*",
+        "Microsoft.Resources/subscriptions/read",
+        "Microsoft.Authorization/roleDefinitions/*",
+        "Microsoft.Authorization/roleAssignments/*",
+        "Microsoft.Authorization/policyDefinitions/*",
+        "Microsoft.Authorization/policyAssignments/*",
+        "Microsoft.EventHub/namespaces/*",
+        "Microsoft.Insights/diagnosticSettings/*",
+        "Microsoft.Compute/galleries/*"
+    ],
+    "NotActions": [],
+    "DataActions": [],
+    "NotDataActions": []
 }
 EOF
 )
